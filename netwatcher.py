@@ -1110,33 +1110,42 @@ class NetWatcher:
             return f"{label} (IP Resolvido: {resolved_ip})"
         return label
 
-    def _fmt_alert(self, service: str, stack: str, dest: str, error: str) -> str:
+    def _format_error_detail(self, error: str, resolved_ip: str | None = None) -> str:
+        clean_error = str(error or "").strip() or "erro não informado"
+        if not resolved_ip:
+            return clean_error
+        # Evita repetir o mesmo IP no detalhe quando ele já está em "Destino da Falha".
+        clean_error = clean_error.replace(f"({resolved_ip})", "").replace(f"[{resolved_ip}]", "")
+        clean_error = " ".join(clean_error.split())
+        return clean_error or "erro não informado"
+
+    def _fmt_alert(self, service: str, stack: str, dest: str, error: str, resolved_ip: str | None = None) -> str:
         """Template unificado de alerta para todos os tipos."""
         error_time_brt = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        clean_error = self._format_error_detail(error, resolved_ip)
         return (
-            f"*🚨 ALERTA DE FALHA {service} 🚨*\n\n"
-            f"🌐 *Pilha:* {stack}\n"
-            f"🖥️ *Origem:* {self.server_name} ({self.server_ip})\n"
-            f"🎯 *Destino da Falha:* {dest}\n"
-            f"❌ *Detalhe do Erro:* {error}\n"
-            f"🕟 *Horário do erro:* {error_time_brt}"
+            f"🚨 ALERTA DE FALHA {service}\n\n"
+            f"🌐 Pilha: {stack}\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"🎯 Destino da Falha: {dest}\n"
+            f"❌ Detalhe do Erro: \"{clean_error}\"\n"
+            f"⏱️ Horário do erro: {error_time_brt}"
         )
 
-    def _fmt_resolved(self, service: str, dest: str, duration: str) -> str:
+    def _fmt_resolved(self, _service: str, dest: str, duration: str) -> str:
         """Template unificado de resolução para todos os tipos."""
         resolved_time_brt = datetime.now(self._alert_tz).strftime("%H:%M:%S")
         return (
-            f"*✅ RESOLVIDO*\n\n"
-            f"🖥️ *Origem:* {self.server_name} ({self.server_ip})\n"
-            f"✅ *Alvo:* {dest}\n"
-            f"🕟 *Horário do resolvido:* {resolved_time_brt}\n"
-            f"⏱️ *Tempo de indisponibilidade:* {duration}"
+            f"✅ RESOLVIDO\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"✅ Alvo: {dest}\n"
+            f"🕟 Horário do resolvido: {resolved_time_brt}\n"
+            f"⏱️ Tempo de indisponibilidade: {duration}"
         )
 
     def _format_tcp_alert(self, item: dict[str, object], err: TestResult) -> str:
         typed_item: dict[str, Any] = dict(item)
-        host = self._tcp_display_host(typed_item, err.family if err.family in ("v4", "v6") else None)
-        port = item["port"]
+        label = self._tcp_check_label(typed_item)
         family = self._tcp_family_mode(typed_item)
         if family == "v4":
             stack = self._stack_label("v4")
@@ -1144,8 +1153,8 @@ class NetWatcher:
             stack = self._stack_label("v6")
         else:
             stack = self._stack_label(err.family, dualstack=True)
-        dest = self._dest_label(f"{host}:{port}", err.resolved_ip)
-        return self._fmt_alert("TCP", stack, dest, err.error)
+        dest = self._dest_label(label, err.resolved_ip)
+        return self._fmt_alert("TCP", stack, dest, err.error, err.resolved_ip)
 
     def _format_tcp_resolved(self, item: dict[str, object], start_ts: float | None = None, resolved_ip: str | None = None) -> str:
         typed_item: dict[str, Any] = dict(item)
@@ -1159,7 +1168,7 @@ class NetWatcher:
             family_hint = mode if mode in ("v4", "v6") else None
 
         host = self._tcp_display_host(typed_item, family_hint)
-        port = item["port"]
+        label = self._tcp_check_label(typed_item)
         if resolved_ip is None:
             if is_ipv4_literal(host) or is_ipv6_literal(host):
                 resolved_ip = host
@@ -1174,7 +1183,7 @@ class NetWatcher:
                     self._quick_resolve(host_v4, "v4")
                     or self._quick_resolve(host_v6, "v6")
                 )
-        dest = self._dest_label(f"{host}:{port}", resolved_ip)
+        dest = self._dest_label(label, resolved_ip)
         return self._fmt_resolved("TCP", dest, self._human_duration(start_ts))
 
     def _test_tcp_target_for_family(self, host: str | None, port: int, family: str) -> TestResult:
@@ -2155,7 +2164,7 @@ class NetWatcher:
         stack = self._stack_label(err.family, dualstack=True)
         resolved_ips = self._resolve_domain_ips(dom)
         dest = self._domain_destination_label(dom, err, resolved_ips)
-        return self._fmt_alert(service, stack, dest, err.error)
+        return self._fmt_alert(service, stack, dest, err.error, err.resolved_ip)
 
     def _format_domain_resolved(self, dom: str, start_ts: float | None = None, trace_family: str | None = None) -> str:
         # Resolve o IP atual da família que estava falhando; tenta ambas se família desconhecida
@@ -2173,7 +2182,7 @@ class NetWatcher:
         service = "Gateway" if label == "gateway" else "ICMP"
         stack = self._stack_label(err.family)
         dest = self._dest_label(label, err.resolved_ip or (err.target if err.target != label else None))
-        return self._fmt_alert(service, stack, dest, err.error)
+        return self._fmt_alert(service, stack, dest, err.error, err.resolved_ip)
 
     def _format_infra_resolved(self, label: str, start_ts: float | None = None, resolved_ip: str | None = None) -> str:
         service = "Gateway" if label == "gateway" else "ICMP"
