@@ -1,0 +1,64 @@
+[Unit]
+Description=NetWatcher network monitoring service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/netwatcher
+ExecStart=/usr/bin/python3 /opt/netwatcher/netwatcher.py
+EnvironmentFile=/etc/netwatcher/netwatcher.env
+Environment=PYTHONUNBUFFERED=1
+
+# Restart com freio para evitar loop infinito em caso de config inválida
+Restart=on-failure
+RestartSec=5
+
+# Shutdown gracioso (alinhado com signal.SIGTERM no script)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Usuário não-privilegiado (criar com: useradd -r -s /sbin/nologin -d /opt/netwatcher netwatcher)
+# ping/ping6 modernos têm cap_net_raw e funcionam sem root.
+# Para mtr: setcap cap_net_raw+ep $(which mtr)
+User=netwatcher
+Group=netwatcher
+
+# Hardening systemd (defesa em profundidade)
+# Conceder cap_net_raw ao processo (necessário para ping/ping6/mtr abrirem socket ICMP).
+# Como concedemos a capability via systemd, NÃO usamos NoNewPrivileges=true, pois ele
+# desabilitaria também as file capabilities herdadas (cap_net_raw em /usr/bin/ping etc.).
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @mount @swap @reboot @obsolete @cpu-emulation
+
+# Único caminho writable: dados do próprio NetWatcher.
+# Inclui o diretório pai pois pending_alerts.json pode não existir no primeiro start
+# e ReadWritePaths sobre arquivo só permite I/O, não criação de inode.
+ReadWritePaths=/opt/netwatcher
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
