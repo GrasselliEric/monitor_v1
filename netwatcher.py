@@ -44,6 +44,22 @@ class MonitorState:
     incident_thread_name: str | None = None
     trace_target: 'TraceTarget | None' = None
     incident_future: Future | None = None
+    # Contadores de degradação de latência (separados do fail_count)
+    latency_fail_count: int = 0
+    latency_alert_active: bool = False
+    latency_outage_t0: float | None = None
+    latency_incident_thread: str | None = None
+    latency_incident_thread_name: str | None = None
+    latency_incident_future: Future | None = None
+    # Detecção de oscilação (flap detection)
+    flap_opens: int = 0
+    flap_window_t0: float | None = None
+    in_flap: bool = False
+    flap_started_t: float | None = None
+    flap_last_cycle_t: float | None = None
+    flap_last_summary_t: float | None = None
+    flap_thread_key: str | None = None
+    flap_thread_name: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 @dataclass
@@ -57,6 +73,7 @@ class TestResult:
     state: str | None = None
     ping_count: int | None = None
     packet_loss_pct: int | None = None
+    high_latency: bool = False
 
 @dataclass
 class TraceTarget:
@@ -229,14 +246,35 @@ class NetWatcher:
                     state.incident_thread = incident_key
                     should_open_incident = True
             if should_open_incident and incident_key:
-                fut = self._handle_incident_async(
-                    kind, label, False, bundle, err, item=tcp_item, incident_key=incident_key
-                )
+                now_mono = time.monotonic()
+                entering_flap = False
+                flap_key = None
                 with state.lock:
-                    # Em caso de corrida rara (reset entre submit e gravação), só mantém
-                    # o future se o incidente ainda estiver ativo para este alvo.
-                    if state.alert_active and state.incident_thread == incident_key:
-                        state.incident_future = fut
+                    if state.flap_window_t0 is None or (now_mono - state.flap_window_t0) > self._flap_window:
+                        state.flap_opens = 0
+                        state.flap_window_t0 = now_mono
+                    state.flap_opens += 1
+                    state.flap_last_cycle_t = now_mono
+                    if state.flap_opens >= self._flap_threshold and not state.in_flap:
+                        state.in_flap = True
+                        state.flap_started_t = time.time()
+                        state.flap_last_summary_t = now_mono
+                        flap_key = self._new_thread_key("flap", label)
+                        state.flap_thread_key = flap_key
+                        entering_flap = True
+                    suppress = state.in_flap
+
+                if entering_flap and flap_key:
+                    self._handle_flap_alert_async(kind, label, flap_key, state.flap_opens)
+                elif not suppress:
+                    fut = self._handle_incident_async(
+                        kind, label, False, bundle, err, item=tcp_item, incident_key=incident_key
+                    )
+                    with state.lock:
+                        # Em caso de corrida rara (reset entre submit e gravação), só mantém
+                        # o future se o incidente ainda estiver ativo para este alvo.
+                        if state.alert_active and state.incident_thread == incident_key:
+                            state.incident_future = fut
         else:
             with state.lock:
                 pending_future = state.incident_future if state.alert_active else None
@@ -244,6 +282,7 @@ class NetWatcher:
             self._await_incident_future(pending_future)
 
             snapshot = None
+            suppress_close = False
             with state.lock:
                 if state.alert_active:
                     snapshot = {
@@ -259,10 +298,129 @@ class NetWatcher:
                 state.trace_target = None
                 state.incident_thread_name = None
                 state.incident_future = None
-            if snapshot is not None:
+                if snapshot is not None and state.in_flap:
+                    state.flap_last_cycle_t = time.monotonic()
+                    suppress_close = True
+            if snapshot is not None and not suppress_close:
                 self._handle_incident_async(
                     kind, label, True, state_snapshot=snapshot, item=tcp_item
                 )
+
+    def _process_latency_result(
+        self,
+        kind: Literal["domain", "tcp", "infra"],
+        label: str,
+        has_high_latency: bool,
+        latency_detail: str,
+        bundle: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Processa degradação de latência separadamente do fail_count.
+        Incrementa latency_fail_count quando high_latency=True; reseta quando normaliza.
+        Dispara alerta de degradação após N consecutivas.
+        """
+        if kind == "domain":
+            state = self.dom_states[label]
+            max_lat_fails = self._domain_latency_max_fails()
+            prefix = "dom"
+        elif kind == "tcp":
+            state = self.tcp_states[label]
+            max_lat_fails = self._tcp_latency_max_fails()
+            prefix = "tcp"
+        elif kind == "infra":
+            state = self.infra_states[label]
+            max_lat_fails = self._ping_latency_max_fails()
+            prefix = "infra"
+        else:
+            raise NotImplementedError(f"kind {kind} não implementado")
+
+        if has_high_latency:
+            should_open = False
+            incident_key = None
+            with state.lock:
+                state.latency_fail_count += 1
+                if state.latency_fail_count == 1:
+                    state.latency_outage_t0 = time.time()
+                if state.latency_fail_count >= max_lat_fails and not state.latency_alert_active:
+                    state.latency_alert_active = True
+                    incident_key = self._new_thread_key(f"{prefix}-lat", label)
+                    state.latency_incident_thread = incident_key
+                    should_open = True
+            if should_open and incident_key:
+                fut = self._handle_latency_incident_async(
+                    kind, label, False, latency_detail, incident_key
+                )
+                with state.lock:
+                    if state.latency_alert_active and state.latency_incident_thread == incident_key:
+                        state.latency_incident_future = fut
+        else:
+            # Latência normalizou — se havia alerta de degradação, envia resolução
+            with state.lock:
+                pending_future = state.latency_incident_future if state.latency_alert_active else None
+
+            self._await_incident_future(pending_future)
+
+            snapshot = None
+            with state.lock:
+                if state.latency_alert_active:
+                    snapshot = {
+                        "thread_key": state.latency_incident_thread,
+                        "thread_name": state.latency_incident_thread_name,
+                        "outage_t0": state.latency_outage_t0,
+                    }
+                state.latency_fail_count = 0
+                state.latency_alert_active = False
+                state.latency_outage_t0 = None
+                state.latency_incident_thread = None
+                state.latency_incident_thread_name = None
+                state.latency_incident_future = None
+            if snapshot is not None:
+                self._handle_latency_incident_async(
+                    kind, label, True, "", snapshot["thread_key"],
+                    state_snapshot=snapshot
+                )
+
+    def _handle_latency_incident_async(
+        self,
+        kind: str,
+        label: str,
+        is_resolved: bool,
+        latency_detail: str,
+        incident_key: str,
+        state_snapshot: dict[str, Any] | None = None,
+    ) -> Future:
+        """Submete alerta/resolução de degradação de latência ao executor."""
+        def _worker():
+            if is_resolved and state_snapshot:
+                text = self._fmt_latency_resolved(label, state_snapshot.get("outage_t0"))
+                thread_key = state_snapshot.get("thread_key")
+                thread_name = state_snapshot.get("thread_name")
+            else:
+                text = self._fmt_latency_alert(label, latency_detail)
+                thread_key = incident_key
+                thread_name = None
+
+            result = self._post_gchat(text, thread_key=thread_key, thread_name=thread_name)
+            if result and result not in ("DRY_RUN", "FAILED_FATAL", None):
+                if kind == "domain":
+                    state = self.dom_states[label]
+                elif kind == "tcp":
+                    state = self.tcp_states[label]
+                else:
+                    state = self.infra_states[label]
+                with state.lock:
+                    if state.latency_alert_active and state.latency_incident_thread == incident_key:
+                        state.latency_incident_thread_name = result
+
+        fut = self._alert_executor.submit(_worker)
+        fut.add_done_callback(self._log_future_error)
+        self._track_future(fut, "alert")
+        return fut
+
+    def _remove_alert_future(self, fut: Future) -> None:
+        with self._active_futures_lock:
+            self._active_alert_futures.discard(fut)
+
     def __init__(self, config_path: str, dry_run: bool = False):
         """
         Inicializa o NetWatcher carregando configuração, preparando estados e pools de threads.
@@ -338,7 +496,7 @@ class NetWatcher:
         infra_labels = [i["label"] for i in self.cfg["icmp_targets"]] + ["gateway"]
         self.infra_states = {lbl: MonitorState() for lbl in infra_labels}
 
-        self._alert_executor = ThreadPoolExecutor(max_workers=int(self.cfg.get("alert_workers", 10)), thread_name_prefix="alert")
+        self._alert_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alert")
         # Pool dedicado para traceroutes — limita mtr simultâneos em quedas massivas
         # (cada mtr pode consumir 20s e CPU significativa).
         self._traceroute_executor = ThreadPoolExecutor(max_workers=int(self.cfg.get("traceroute_workers", 3)), thread_name_prefix="trace")
@@ -349,6 +507,10 @@ class NetWatcher:
         self._queue_lock = threading.Lock()
         self._queue_cooldown_until = 0.0  # Epoch até quando o envio ao GChat deve aguardar após um 429
         self._alert_dedupe_window_seconds = float(self.cfg.get("alert_dedupe_window_seconds", 60.0))
+        self._flap_threshold = int(self.cfg.get("flap_threshold_cycles", 5))
+        self._flap_window = float(self.cfg.get("flap_window_seconds", 300.0))
+        self._flap_interval = float(self.cfg.get("flap_summary_interval_seconds", 600.0))
+        self._flap_stable = float(self.cfg.get("flap_stable_seconds", 300.0))
         self._alert_dedupe_lock = threading.Lock()
         self._recent_alert_fingerprints: dict[str, float] = {}
         self._recent_alert_fingerprint_order: deque[tuple[float, str]] = deque()
@@ -579,11 +741,13 @@ class NetWatcher:
             "domain_max_fails",
             "tcp_max_fails",
             "ping_max_fails",
+            "domain_latency_max_fails",
+            "tcp_latency_max_fails",
+            "ping_latency_max_fails",
             "domains_per_cycle",
             "icmp_count",
             "max_queue_drain_per_cycle",
             "queue_save_every_ops",
-            "alert_workers",
             "traceroute_workers",
             "probe_timeout_seconds",
         ):
@@ -593,7 +757,7 @@ class NetWatcher:
         v = cfg.get("max_latency_ms")
         if v is not None and (not _is_int(v) or v < 50):
             errors.append(f"'max_latency_ms' deve ser inteiro >= 50, recebido: {v!r}")
-        _WORKER_LIMITS: dict[str, int] = {"alert_workers": 50, "traceroute_workers": 10, "domains_per_cycle": 30}
+        _WORKER_LIMITS: dict[str, int] = {"traceroute_workers": 10, "domains_per_cycle": 30}
         for wk, wmax in _WORKER_LIMITS.items():
             wv = cfg.get(wk)
             if wv is not None and _is_int(wv) and wv > wmax:
@@ -610,6 +774,13 @@ class NetWatcher:
         v = cfg.get("alert_dedupe_window_seconds")
         if v is not None and (not _is_number(v) or v < 0):
             errors.append(f"'alert_dedupe_window_seconds' deve ser número >= 0, recebido: {v!r}")
+        v = cfg.get("flap_threshold_cycles")
+        if v is not None and (not _is_int(v) or v < 2):
+            errors.append(f"'flap_threshold_cycles' deve ser inteiro >= 2, recebido: {v!r}")
+        for k in ("flap_window_seconds", "flap_summary_interval_seconds", "flap_stable_seconds"):
+            v = cfg.get(k)
+            if v is not None and (not _is_number(v) or v <= 0):
+                errors.append(f"'{k}' deve ser número > 0, recebido: {v!r}")
         v = cfg.get("traceroute_timeout_seconds")
         if v is not None and (not _is_number(v) or v <= 0):
             errors.append(f"'traceroute_timeout_seconds' deve ser número > 0, recebido: {v!r}")
@@ -1016,7 +1187,7 @@ class NetWatcher:
         if not random_subdomain and status_name == "NOERROR" and answer_count == 0:
             return TestResult(False, f"DNS-{family} FAIL", f"DNS {family} sem resposta {rr}", fqdn, family=family, resolved_ip=resolved_ip)
         if latency > max_ms:
-            return TestResult(False, metric_label, f"DNS {family} latency {latency}ms > {max_ms}ms", fqdn, family=family, resolved_ip=resolved_ip)
+            return TestResult(True, metric_label, f"DNS {family} latency {latency}ms > {max_ms}ms", fqdn, family=family, resolved_ip=resolved_ip, high_latency=True)
         return TestResult(True, metric_label, "", fqdn, family=family, resolved_ip=resolved_ip)
 
     def _quick_resolve(self, host: str, family: str) -> str | None:
@@ -1058,7 +1229,7 @@ class NetWatcher:
         latency = int((time.time() - t0) * 1000)
         max_ms = self.cfg["max_latency_ms"]
         if latency > max_ms:
-            return TestResult(False, f"TCP{port}-{family} {latency}ms", f"TCP {port} {family} latency {latency}ms > {max_ms}ms", host, resolved_ip, family)
+            return TestResult(True, f"TCP{port}-{family} {latency}ms", f"TCP {port} {family} latency {latency}ms > {max_ms}ms", host, resolved_ip, family, high_latency=True)
         return TestResult(True, f"TCP{port}-{family} {latency}ms", "", host, resolved_ip, family)
 
     def _tcp_no_address_result(self, host: str, port: int, family: str) -> TestResult:
@@ -1141,6 +1312,29 @@ class NetWatcher:
             f"✅ Alvo: {dest}\n"
             f"🕟 Horário do resolvido: {resolved_time_brt}\n"
             f"⏱️ Tempo de indisponibilidade: {duration}"
+        )
+
+    def _fmt_latency_alert(self, target: str, detail: str) -> str:
+        """Template de alerta de degradação de latência."""
+        alert_time = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        return (
+            f"⚠️ DEGRADAÇÃO DE LATÊNCIA\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"🎯 Alvo: {target}\n"
+            f"📈 Detalhe: \"{detail}\"\n"
+            f"🕟 Horário: {alert_time}"
+        )
+
+    def _fmt_latency_resolved(self, target: str, outage_t0: float | None) -> str:
+        """Template de resolução de degradação de latência."""
+        resolved_time = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        duration = self._human_duration(outage_t0)
+        return (
+            f"✅ LATÊNCIA NORMALIZADA\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"✅ Alvo: {target}\n"
+            f"🕟 Horário: {resolved_time}\n"
+            f"⏱️ Duração da degradação: {duration}"
         )
 
     def _format_tcp_alert(self, item: dict[str, object], err: TestResult) -> str:
@@ -1273,7 +1467,7 @@ class NetWatcher:
         max_ms = self.cfg["max_latency_ms"]
         if latency > max_ms:
             return TestResult(
-                False,
+                True,
                 f"{label}-{family} {latency:.1f}ms",
                 f"ICMP {family} latency {latency:.1f}ms > {max_ms}ms",
                 label,
@@ -1281,6 +1475,7 @@ class NetWatcher:
                 family,
                 ping_count=transmitted,
                 packet_loss_pct=loss,
+                high_latency=True,
             )
         return TestResult(
             True,
@@ -1337,6 +1532,19 @@ class NetWatcher:
         m = self._RE_TIME_MS.search(out)
         latency = float(m.group(1)) if m else 0.0
         latency_text = f"{latency:.1f}ms" if m else "n/a"
+        max_ms = self.cfg["max_latency_ms"]
+        if m and latency > max_ms:
+            return TestResult(
+                True,
+                f"GW-{family} {latency_text}",
+                f"Gateway {family} latency {latency:.1f}ms > {max_ms}ms",
+                "gateway",
+                gw,
+                family,
+                ping_count=transmitted,
+                packet_loss_pct=loss,
+                high_latency=True,
+            )
         return TestResult(
             True,
             f"GW-{family} {latency_text}",
@@ -2053,6 +2261,154 @@ class NetWatcher:
         safe_label = self._RE_SAFE_CHARS.sub("_", label.lower())
         return f"{prefix}_{safe_host}_{safe_label}_{int(time.time())}_{secrets.token_hex(4)}"
 
+    # ------------------------------------------------------------------
+    # Flap detection — detecção e supressão de alertas em oscilação
+    # ------------------------------------------------------------------
+
+    def _handle_flap_alert_async(self, kind: str, label: str, flap_key: str, cycle_count: int) -> None:
+        """Dispara alerta de entrada em modo flap em background."""
+        if kind == "domain":
+            states: dict[str, MonitorState] = self.dom_states
+        elif kind == "tcp":
+            states = self.tcp_states
+        else:
+            states = self.infra_states
+
+        def worker() -> None:
+            text = self._fmt_flap_alert(label, cycle_count, self._flap_window, self._flap_interval)
+            thread_name = self._post_gchat(text, flap_key)
+            if thread_name and thread_name not in ("DRY_RUN", "FAILED_FATAL"):
+                with states[label].lock:
+                    if states[label].flap_thread_key == flap_key:
+                        states[label].flap_thread_name = thread_name
+
+        fut = self._alert_executor.submit(worker)
+        fut.add_done_callback(self._log_future_error)
+        self._track_future(fut, "alert")
+
+    def _send_flap_summary_async(
+        self,
+        label: str,
+        thread_key: str | None,
+        thread_name: str | None,
+        started_t: float | None,
+    ) -> None:
+        """Envia mensagem periódica 'X continua oscilando' em background."""
+        def worker() -> None:
+            text = self._fmt_flap_summary(label, started_t, self._flap_interval)
+            self._post_gchat(text, thread_key, thread_name)
+
+        fut = self._alert_executor.submit(worker)
+        fut.add_done_callback(self._log_future_error)
+        self._track_future(fut, "alert")
+
+    def _send_flap_resolved_async(
+        self,
+        label: str,
+        thread_key: str | None,
+        thread_name: str | None,
+        started_t: float | None,
+        still_in_outage: bool,
+    ) -> None:
+        """Envia mensagem de saída do modo flap em background."""
+        def worker() -> None:
+            text = self._fmt_flap_resolved(label, started_t, still_in_outage)
+            self._post_gchat(text, thread_key, thread_name)
+
+        fut = self._alert_executor.submit(worker)
+        fut.add_done_callback(self._log_future_error)
+        self._track_future(fut, "alert")
+
+    def _check_flap_summaries(self) -> None:
+        """Chamado a cada ciclo: envia resumos periódicos e detecta saída do modo flap."""
+        now_mono = time.monotonic()
+        for kind, states in (
+            ("domain", self.dom_states),
+            ("tcp", self.tcp_states),
+            ("infra", self.infra_states),
+        ):
+            for label, state in states.items():
+                stable = due = False
+                tk = tn = started_t = still_in_outage = None  # type: ignore[assignment]
+                with state.lock:
+                    if not state.in_flap:
+                        continue
+                    stable = (
+                        state.flap_last_cycle_t is not None
+                        and (now_mono - state.flap_last_cycle_t) >= self._flap_stable
+                    )
+                    due = not stable and (
+                        state.flap_last_summary_t is None
+                        or (now_mono - state.flap_last_summary_t) >= self._flap_interval
+                    )
+                    tk = state.flap_thread_key
+                    tn = state.flap_thread_name
+                    started_t = state.flap_started_t
+                    still_in_outage = state.alert_active
+                    if stable:
+                        state.in_flap = False
+                        state.flap_opens = 0
+                        state.flap_window_t0 = None
+                        state.flap_last_cycle_t = None
+                        state.flap_last_summary_t = None
+                        state.flap_thread_key = None
+                        state.flap_thread_name = None
+                        state.flap_started_t = None
+                        if still_in_outage:
+                            # Limpa incidente pendente suprimido para que o próximo
+                            # probe com falha possa disparar alerta normal imediatamente.
+                            state.alert_active = False
+                            state.incident_thread = None
+                            state.incident_thread_name = None
+                            state.incident_future = None
+                    elif due:
+                        state.flap_last_summary_t = now_mono
+
+                if stable:
+                    self._send_flap_resolved_async(label, tk, tn, started_t, bool(still_in_outage))
+                elif due:
+                    self._send_flap_summary_async(label, tk, tn, started_t)
+
+    def _fmt_flap_alert(self, label: str, cycles: int, window_secs: float, interval_secs: float) -> str:
+        ts = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        window_min = max(1, int(window_secs // 60))
+        interval_min = max(1, int(interval_secs // 60))
+        return (
+            f"⚡ OSCILAÇÃO DETECTADA\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"🎯 Alvo: {label}\n"
+            f"🔁 Ciclos detectados: {cycles} em {window_min} min\n"
+            f"⏸️ Alertas individuais suprimidos\n"
+            f"🕟 Horário: {ts}\n"
+            f"⏱️ Próxima atualização em até {interval_min} min"
+        )
+
+    def _fmt_flap_summary(self, label: str, started_t: float | None, interval_secs: float) -> str:
+        ts = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        duration = self._human_duration(started_t)
+        interval_min = max(1, int(interval_secs // 60))
+        return (
+            f"⚡ OSCILAÇÃO EM ANDAMENTO\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"🎯 Alvo: {label}\n"
+            f"⏱️ Oscilando há: {duration}\n"
+            f"🕟 Horário: {ts}\n"
+            f"⏱️ Próxima atualização em até {interval_min} min"
+        )
+
+    def _fmt_flap_resolved(self, label: str, started_t: float | None, still_in_outage: bool) -> str:
+        ts = datetime.now(self._alert_tz).strftime("%H:%M:%S")
+        duration = self._human_duration(started_t)
+        suffix = "\n⚠️ Alvo ainda offline — alertas normais retomados" if still_in_outage else "\n▶️ Alertas individuais retomados"
+        return (
+            f"✅ OSCILAÇÃO ENCERRADA\n\n"
+            f"🖥️ Origem: {self.server_name} ({self.server_ip})\n"
+            f"🎯 Alvo: {label}\n"
+            f"⏱️ Duração total: {duration}\n"
+            f"🕟 Horário: {ts}"
+            f"{suffix}"
+        )
+
     def _trace_cmd(self, target: str, family: str | None) -> list[str]:
         cmd = list(self.cfg.get("traceroute_cmd", ["mtr", "-n", "-r", "-c", "3", "-w"]))
         bin_name = os.path.basename(cmd[0])
@@ -2262,6 +2618,15 @@ class NetWatcher:
     def _ping_max_fails(self) -> int:
         return max(1, int(self.cfg.get("ping_max_fails", self.cfg.get("max_fails", 3))))
 
+    def _domain_latency_max_fails(self) -> int:
+        return max(1, int(self.cfg.get("domain_latency_max_fails", 5)))
+
+    def _tcp_latency_max_fails(self) -> int:
+        return max(1, int(self.cfg.get("tcp_latency_max_fails", 5)))
+
+    def _ping_latency_max_fails(self) -> int:
+        return max(1, int(self.cfg.get("ping_latency_max_fails", 5)))
+
     def _install_signal_handlers(self) -> None:
         """Instala handlers para SIGTERM/SIGINT para shutdown gracioso.
         Evita perda de alertas em flight ao receber 'systemctl stop' ou Ctrl+C."""
@@ -2350,6 +2715,7 @@ class NetWatcher:
                 _log_context.cycle_id = secrets.token_hex(4)
 
                 self._process_alert_queue() # Tenta descarregar mensagens pendentes
+                self._check_flap_summaries()
 
                 domains = self._flat_domains
                 domains_per_cycle = max(1, int(self.cfg.get("domains_per_cycle", 1)))
@@ -2532,6 +2898,14 @@ class NetWatcher:
                         _dom_log(v4_line)
                         _dom_log(v6_line)
                     self._process_check_result("domain", dom, err, bundle)
+                    # Degradação de latência: verifica se alguma sonda do domínio teve high_latency
+                    dom_latency_results = [dns4, dns6, tcp80_4, tcp80_6, tcp443_4, tcp443_6]
+                    dom_high_lat = [r for r in dom_latency_results if r.high_latency]
+                    if dom_high_lat:
+                        detail = dom_high_lat[0].error
+                        self._process_latency_result("domain", dom, True, detail, bundle)
+                    else:
+                        self._process_latency_result("domain", dom, False, "", bundle)
 
                 for label, bundle, err, item in sorted(tcp_results, key=lambda x: x[0]):
                     res4 = bundle.get("tcp4")
@@ -2552,6 +2926,12 @@ class NetWatcher:
                         _tcp_log = self._log_warn if next_fails > 0 else self._log_debug
                         _tcp_log(line.strip())
                     self._process_check_result("tcp", label, err, bundle)
+                    # Degradação de latência TCP
+                    tcp_lat_results = [r for r in (res4, res6) if r is not None and r.high_latency]
+                    if tcp_lat_results:
+                        self._process_latency_result("tcp", label, True, tcp_lat_results[0].error, bundle)
+                    else:
+                        self._process_latency_result("tcp", label, False, "", bundle)
 
                 ping_max = self._ping_max_fails()
                 log_infra_each_domain = bool(self.cfg.get("log_infra_each_domain", True))
@@ -2571,6 +2951,12 @@ class NetWatcher:
                             f"{res6.metric} | status={res6.state or ('OK' if res6.ok else 'FAIL')}"
                         )
                     self._process_check_result("infra", label, infra_err)
+                    # Degradação de latência ICMP
+                    icmp_lat = [r for r in (res4, res6) if r.high_latency]
+                    if icmp_lat:
+                        self._process_latency_result("infra", label, True, icmp_lat[0].error)
+                    else:
+                        self._process_latency_result("infra", label, False, "")
 
                 # Gateway tratado como label "gateway" no mesmo state-machine que ICMP.
                 # Falha em qualquer família (v4/v6) conta como falha do gateway.
@@ -2591,6 +2977,12 @@ class NetWatcher:
                     )
                 if self.cfg.get("enable_gateway_test", True):
                     self._process_check_result("infra", "gateway", gw_err)
+                    # Degradação de latência Gateway
+                    gw_lat = [r for r in (gw4, gw6) if r.high_latency]
+                    if gw_lat:
+                        self._process_latency_result("infra", "gateway", True, gw_lat[0].error)
+                    else:
+                        self._process_latency_result("infra", "gateway", False, "")
 
                 self.domain_index = (self.domain_index + domains_per_cycle) % len(domains)
 
